@@ -1,0 +1,1 @@
+f7ad0bfe74b7be9357032451999ded5e  msfetch.0.5/msfetch.tar.gz
