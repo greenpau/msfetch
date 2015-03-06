@@ -1,0 +1,568 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# Version 0.5
+# Added 2 failed URL link in debug
+# Added print out of the Module version in debug
+# Added "debug" and "password" switch
+# Added help menu
+
+
+my @modules = ("LWP::UserAgent","URI","URI::Escape","XML::LibXML","Time::Local","HTTP::Cookies","Getopt::Long");
+
+foreach my $module (@modules) {
+ if (checkModule($module)) {
+  print $module." ".$module->VERSION." is installed...OK!\n";
+ } else {
+  die $module." is not installed...FAILED!\n";
+ }
+}
+
+my $DEBUG;
+my $help = "";
+my $advpass = "";
+my $verbose = "";
+
+my $result = GetOptions ("help|h|?",     => \$help,
+                         "password|p"    => \$advpass,
+                         "debug|d"       => \$verbose,);
+
+if ($help) {
+ usage();
+}
+
+if ($verbose) {
+ $DEBUG = 1;
+}
+
+use Fcntl qw(:flock);
+open SELF, ">> $0" or die("Unable to lock the file");
+flock(SELF, LOCK_EX) or die "Cannot lock - $!";  # Exclusive lock
+
+print "\nmsfetch v0.5 - download e-mail messages from Exchange OWA 2000/2003/2007 to mbox\n\n";
+
+my $rootdir=$ENV{HOME};
+my $configfile=$rootdir."/.msfetchrc";
+if (-e $configfile) {
+ print "Configuration file exists $configfile...\n" if (defined $DEBUG);
+} else {
+ print "No configuration file found. Please create $configfile.\n\n";
+ exit 1;
+}
+
+################# CORE VARIABLES ###################################
+my $strServer = "N/A";
+my $strDomain = "N/A";
+my $strAlias = "N/A";
+my $strAliasUser = "N/A";
+my $strProt = "https";
+my $strPort = "N/A";
+my $strMethod = "owa";
+my $strPassword = "N/A";
+my $strFolder = "N/A";
+my $strMbox = "N/A";
+my $strOutbox = "N/A";
+my $strHistory = "N/A";
+my %mailhistory = ();
+my %errorhistory = ();
+my %mailfolderlist = ();
+my %mailfolderexc = ();
+my $excpattern = "NOTHING";
+my $mailfoldercount = 0;
+my $starttime = GenerateTs();
+readConfig();
+my $strError = $strHistory.".error";
+createExcPattern();
+if ( $strPort ne 'N/A' ) { $strServer .= ":$strPort"; }
+my $strUrl = $strProt."://" . $strServer . "/exchange/" . $strAliasUser . "/";
+my $strUrlOut = $strProt."://" . $strServer . "/exchange/" . $strAliasUser . "/Sent%20Items/";
+my $authUrl = $strProt."://" . $strServer . "/exchweb/bin/auth/owaauth.dll";
+my $ua = LWP::UserAgent->new( keep_alive => 1 );
+my $cookie_jar = HTTP::Cookies->new( autosave => 1, ignore_discard => 1);
+$ua->cookie_jar($cookie_jar);
+####################################################################
+
+readHistory();
+readError();
+displayVars();
+if($strMethod eq "windows-basic") {
+ loginWinMail() or die "Login Failed!\n";
+} elsif ($strMethod eq "owa") {
+ loginOwaMail() or die "Login Failed!\n";
+} elsif ($strMethod eq "owa2007") {
+ loginOwa2007Mail() or die "Login Failed!\n";
+} else {
+ print "Unknown authentication method was specified. Currently we support Windows Authentication and OWA Authentication mechanisms.\n\n";
+ exit 1;
+}
+
+
+print "Listing E-Mail Folders...\n";
+listFolders($strUrl);
+print "Number of folders: ".keys( %mailfolderlist )."\n";
+
+if(keys( %mailfolderlist ) > 0 ) {
+ print "Number of folder to fetch: ".keys( %mailfolderlist )."\n" if (defined $DEBUG);
+ foreach my $key (keys(%mailfolderlist)) {
+  print "Fetching $mailfolderlist{$key}\n"; # if (defined $DEBUG);
+  my $folder_content = fetchFolder($mailfolderlist{$key});
+  parseFolder($folder_content);
+  print "Completed $mailfolderlist{$key}\n"; # if (defined $DEBUG);
+ }
+} else {
+ print "There are no folders to fetch.\n"; #if (defined $DEBUG);
+}
+
+
+close SELF;
+
+print "Started:   ".$starttime."\n";
+print "Completed: ".GenerateTs()."\n";
+exit 0;
+
+
+######################## DO NOT CHANGE ANYTHING BELOW THIS LINE #####################################
+
+######################################## FUNCTIONS ##################################################
+
+sub usage {
+ print <<ENDUSAGE;
+
+ msFetch v0.5 - remote MS Exchange mail retrieval utility
+
+ Usage:
+ msFetch
+ msFetch --help
+ msFetch --password xyz123*!
+
+   [OPTION]
+   -h, --help          display this message
+   -d, --debug       display debug output (default: no)
+
+   [optional]
+   -p, --password      overwrite password (ex: SecurID)
+
+ENDUSAGE
+exit 1;
+}
+
+sub GenerateTs {
+ my @Ts = localtime(time());
+ return sprintf("%04s/%02s/%02s %02s:%02s:%02s" , $Ts[5]+1900, $Ts[4]+1, $Ts[3], $Ts[2], $Ts[1], $Ts[0]);
+}
+
+sub loginWinMail {
+ my $login_req = HTTP::Request->new( GET => $strUrl );
+ $login_req->authorization_basic($strDomain."\\".$strAlias, $strPassword);
+ my $login_res = $ua->request($login_req);
+ if ($login_res->is_success) {
+  print "Login successful!\n";
+  #print "Response Code: " . $login_res->code . "\n"
+  return 1;
+ } else {
+  print "Response: " . $login_res->status_line . "\n" if (defined $DEBUG);
+  print "Login failed using ".$strDomain."\\".$strAlias." and password ".$strPassword."...\n" if (defined $DEBUG);
+  return 0;
+ }
+}
+
+sub loginOwaMail {
+ my $ls = 'destination=' . $authUrl . '&username=' . uri_escape($strAlias) . '&password=' . uri_escape($strPassword);
+ my $login_req = HTTP::Request->new( POST => $authUrl );
+ $login_req->content_type('application/x-www-form-urlencoded');
+ $login_req->content( $ls );
+ my $login_res = $ua->request($login_req);
+ if ($login_res->is_success) {
+  print "Login successful!\n";
+  return 1;
+ } else {
+  print "Response: " . $login_res->status_line . "\n" if (defined $DEBUG);
+  print "Login failed using ($ls)...\n" if (defined $DEBUG);
+  return 0;
+ }
+}
+
+sub loginOwa2007Mail {
+ my $ls = 'destination='. $strProt."://" . $strServer . "/exchange/" .'&flags=0&forcedownlevel=0&trusted=0&username='.uri_escape($strAlias).'&password='.uri_escape($strPassword).'&isUtf8=1';
+ print "Login Request Content:\n".$ls."\n" if (defined $DEBUG);
+ my $login_req = HTTP::Request->new( POST => $authUrl );
+ $login_req->content_type('application/x-www-form-urlencoded');
+ $login_req->content( $ls );
+ my $login_res = $ua->request($login_req);
+ if(CookieCount($cookie_jar->as_string) > 2) {
+  print "-------------------------------------------------------------\n" if (defined $DEBUG);
+  print "Response: " . $login_res->as_string . "\n" if (defined $DEBUG);
+  print "Login successful!\n";
+  print "-------------------------------------------------------------\n" if (defined $DEBUG);
+  return 1;
+ } else {
+  print "Response: " . $login_res->status_line . "\n" if (defined $DEBUG);
+  print "Login failed using ($ls)...\n" if (defined $DEBUG);
+  return 0;
+ }
+}
+
+
+sub displayVars {
+ print "Using following parameters...\n" if (defined $DEBUG);
+ print "Mail Server: ".$strServer."\n" if (defined $DEBUG);
+ print "OWA Protocol: ".$strProt."\n" if (defined $DEBUG);
+ print "Authentication Method: ".$strMethod."\n" if (defined $DEBUG);
+ print "Domain: ".$strDomain."\n" if (defined $DEBUG);
+ print "Username: ".$strAlias."\n" if (defined $DEBUG);
+ print "UsernamePath: ".$strAliasUser."\n" if (defined $DEBUG);
+ print "Password: ".$strPassword."\n" if (defined $DEBUG);
+ print "Folder: ".$strFolder."\n" if (defined $DEBUG);
+ print "Mbox: ".$strMbox."\n" if (defined $DEBUG);
+ print "Outbox: ".$strOutbox."\n" if (defined $DEBUG);
+ print "History: ".$strHistory."\n" if (defined $DEBUG);
+ print "URL: ".$strUrl."\n" if (defined $DEBUG);
+}
+
+sub listFolders {
+ my($trgUrl) = @_;
+ my $strQuery = "<?xml version=\"1.0\"?><D:searchrequest xmlns:D = \"DAV:\">"
+		. "<D:sql>SELECT \"DAV:id\", \"DAV:href\" FROM \"" . $trgUrl . "\""
+		. " WHERE \"DAV:ishidden\" = false AND \"DAV:isfolder\" = true"
+		. " </D:sql></D:searchrequest>"; 
+ print "Query: ".$strQuery."\n" if (defined $DEBUG);
+ my $reg_request = HTTP::Request->new(SEARCH => $trgUrl);
+ $reg_request->content($strQuery);
+ $reg_request->content_type("text/xml; charset=utf-8");
+ if($strMethod eq "windows-basic") {
+  $reg_request->authorization_basic($strDomain."\\".$strAlias, $strPassword);
+ }
+ my $response = $ua->request($reg_request);
+ if ($response->is_success) {
+  print "Fetch folder listing success ($trgUrl)...\n" if (defined $DEBUG);
+  my $parser = XML::LibXML->new();
+  my $tree = $parser->parse_string($response->content);
+  my $root = $tree->getDocumentElement;
+  foreach my $id ($root->findnodes('a:response')) {
+   my $folder_href =  $id->findvalue('a:propstat/a:prop/a:href');
+   if($folder_href =~ m/($excpattern)/) {
+    print "skipping folder ($folder_href), exclusion list...\n"; #if (defined $DEBUG);
+   } else {
+    print "processing folder ($folder_href)\n"; #if (defined $DEBUG);
+    $mailfoldercount++;
+    $mailfolderlist{$mailfoldercount} = $folder_href;
+    listFolders($folder_href);
+   }
+  }
+  return;
+ } else {
+  print "Fetch folder listing failed ($trgUrl)...\n" if (defined $DEBUG);
+  print $response->content if (defined $DEBUG);
+  print "\n" if (defined $DEBUG);
+  return;
+ }
+}
+
+sub readConfig {
+print "Reading configuration file...\n" if (defined $DEBUG); 
+open (CONF, "<$configfile") or die(print "Can't open config file: $!\n");
+foreach my $confline (<CONF>) {
+ chomp($confline);
+ if($confline =~ /^MAILSERVER=(.*)$/) {
+  $strServer = $1;
+ } 
+ if($confline =~ /^MAILUSER=(.*)$/) {
+  $strAlias = $1;
+ }
+ if($confline =~ /^MAILUSERDAV=(.*)$/) {
+  $strAliasUser = $1;
+ }
+ if($confline =~ /^MAILDOMAIN=(.*)$/) {
+  $strDomain = $1;
+ }
+ if($confline =~ /^MAILCRED=(.*)$/) {
+  $strPassword = $1;
+ }
+ if($confline =~ /^MAILBOXFILE=(.*)$/) {
+  $strMbox = $1;
+ }
+ if($confline =~ /^MAILHISTORY=(.*)$/) {
+  $strHistory = $1;
+ }
+ if($confline =~ /^MAILFOLDER=(.*)$/) {
+  $strFolder = $1;
+ }
+ if($confline =~ /^EXCLUDE=(.*)$/) {
+  $mailfolderexc{$1} = "1";
+ }
+ if($confline =~ /^MAILOUTBOX=(.*)$/) {
+  $strOutbox = $1;
+ }
+ if($confline =~ /^MAILPROT=(.*)$/) {
+  $strProt = $1;
+ }
+ if($confline =~ /^MAILPORT=(.*)$/) {
+  $strPort = $1;
+ }
+ if($confline =~ /^MAILMETHOD=(.*)$/) {
+  $strMethod = $1;
+ }
+}
+close (CONF);
+}
+
+sub readHistory {
+ print "Reading history file...\n" if (defined $DEBUG);
+ if (-e $strHistory) {
+  print "History file exists $strHistory...\n" if (defined $DEBUG);
+  open (HIST, "<$strHistory") or die(print "Can't open history file: $!\n");
+  my $count = 0;
+  foreach my $histline (<HIST>) {
+   chomp($histline);
+   if($histline =~ /^UID=(.*)$/) {
+    $mailhistory{$1} = "1";
+     $count++;
+   }
+  }
+  close (HIST);
+  print "# of e-mail in history file...$count\n" if (defined $DEBUG);
+ } else {
+  print "No history file found...\n" if (defined $DEBUG);
+ }
+}
+
+sub readError {
+ print "Reading error file...\n" if (defined $DEBUG);
+ if (-e $strError) {
+  print "History file exists $strError...\n" if (defined $DEBUG);
+  open (HISTERR, "<$strError") or die(print "Can't open error file: $!\n");
+  my $count = 0;
+  foreach my $errline (<HISTERR>) {
+   chomp($errline);
+   if($errline =~ /^UID=(.*)$/) {
+    $errorhistory{$1} = "1";
+     $count++;
+   }
+  }
+  close (HISTERR);
+  print "# of e-mail in error file...$count\n" if (defined $DEBUG);
+ } else {
+  print "No error file found...\n" if (defined $DEBUG);
+ }
+}
+
+
+sub fetchFolder {
+ my($foldername) = @_;
+ my $strQuery = "<?xml version=\"1.0\"?><D:searchrequest xmlns:D = \"DAV:\">"
+                . "<D:sql>SELECT \"urn:schemas:mailheader:from\", \"urn:schemas:httpmail:datereceived\", \"DAV:id\", \"DAV:href\","
+                . "\"http://schemas.microsoft.com/exchange/permanenturl\""
+                . " FROM \"" . $foldername . "\""
+                . " WHERE \"DAV:ishidden\" = false AND \"DAV:isfolder\" = false"
+                . "</D:sql></D:searchrequest>";
+ print "Query: ".$strQuery."\n" if (defined $DEBUG);
+ my $reg_request = HTTP::Request->new(SEARCH => $foldername);
+ $reg_request->content($strQuery);
+ $reg_request->content_type("text/xml; charset=utf-8");
+ if($strMethod eq "windows-basic") {
+  $reg_request->authorization_basic($strDomain."\\".$strAlias, $strPassword);
+ }
+ my $response = $ua->request($reg_request);
+ if ($response->is_success) {
+  print "Fetch \"".$foldername."\" Success...\n" if (defined $DEBUG);
+  return $response->content;
+ } else {
+  print "Fetch \"".$foldername."\" Failed...\n" if (defined $DEBUG);
+  return 0;
+ }
+}
+
+
+sub DstOffset {
+ my @DstTs = localtime(time());
+ my $tsoffset = 0;
+ my $tszone = sprintf("%s" , $DstTs[8]);
+ if ($tszone == 1) {
+  # EDT Time - Daylight Savings Time
+  # $tsoffset = 14400;
+  $tsoffset = 0;
+ }
+ elsif ($tszone == 0) {
+  # EST Time
+  # $tsoffset = 18000;
+  $tsoffset = 3600;
+ }
+ return $tsoffset;
+}
+
+sub convertDate {
+ my($orig) = @_;
+ # Windows date format: 2009-08-03T23:44:47.000Z
+ # Mbox desired date format:  Tue Jun 30 12:00:03 2009
+ if($orig =~ /(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\w{4})/) {
+  #my @Ts = localtime(timegm($6, $5, $4, $3 ,$2-1 ,$1%100));
+  #return sprintf("%04s%02s%02s %02s:%02s:%02s" , $Ts[5]+1900, $Ts[4]+1, $Ts[3], $Ts[2], $Ts[1], $Ts[0]);
+  return scalar localtime(timegm($6, $5, $4, $3 ,$2-1 ,$1%100) + DstOffset);;
+ } else {
+  return "N/A";
+ }
+}
+
+sub convertFrom {
+ my($orig) = @_;
+ my $mailregex = "[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?";
+ if($orig =~ /.*<(.*)>.*/) {
+  my $tmpemail = $1;
+  if($tmpemail =~ /($mailregex)/) {
+   return $1;
+  } else {
+   return "N/A";
+  }
+ } elsif ($orig =~ /($mailregex)/) {
+  return $1;
+ } else {
+  return "N/A";
+ }
+}
+
+sub convertLink {
+ my($orig) = @_;
+ if($orig =~ /(.*)/) {
+  return $1;
+ } else {
+  return "N/A";
+ }
+}
+
+sub processUid {
+ my($web_uid) = @_;
+ chomp($web_uid);
+ if($web_uid =~ m/(.*)(\/-FlatUrlSpace-.*)/) {
+  return $2;
+ } else {
+  return "N/A";
+ }
+}
+
+sub parseFolder {
+ my($response_body) = @_;
+ my $parser = XML::LibXML->new();
+ my $tree = $parser->parse_string($response_body);
+ my $root = $tree->getDocumentElement;
+ foreach my $id ($root->findnodes('a:response')) {
+  my $mail_id =  $id->findvalue('a:propstat/a:prop/a:id');
+  my $mail_href =  $id->findvalue('a:propstat/a:prop/a:href');
+  my $mail_from =  $id->findvalue('a:propstat/a:prop/d:from');
+  my $mail_rec =  $id->findvalue('a:propstat/a:prop/e:datereceived');
+  my $mail_uid_temp =  $id->findvalue('a:propstat/a:prop/f:permanenturl');
+  my $mail_uid = processUid($mail_uid_temp);
+  print "ID: $mail_id\n" if (defined $DEBUG);
+  print "Link: $mail_href\n" if (defined $DEBUG);
+  my $mail_unix_href = convertLink($mail_href);
+  print "From: $mail_from\n" if (defined $DEBUG);
+  print "WIN Date: $mail_rec\n" if (defined $DEBUG);
+  my $mail_unix_rec = convertDate($mail_rec);
+  print "Unix Date: ".$mail_unix_rec."\n" if (defined $DEBUG);
+  my $mail_unix_from = convertFrom($mail_from);
+  print "Parsed E-mail: ".$mail_unix_from."\n" if (defined $DEBUG);
+  print "Header: From ".convertFrom($mail_from)." ".convertDate($mail_rec)."\n" if (defined $DEBUG);
+  if (exists $mailhistory{$mail_uid}) {
+   print "skipping message $mail_id, since it is already in $strMbox (ref. $strHistory)\n" if (defined $DEBUG);
+  } elsif (exists $errorhistory{$mail_uid}) {
+   print "skipping message $mail_id, since it is marked as \"bad\" (ref. $strError)\n" if (defined $DEBUG);
+  } elsif ($mail_unix_rec eq "N/A") {
+   print "Unable to parse e-mail timestamp, this e-mail will not be processed...\n";
+  } elsif ($mail_unix_from eq "N/A") {
+   print "Unable to parse sender's e-mail address, this e-mail will not be processed...\n";
+   print "$mail_from\n";
+   recordFailedEmail($mail_uid,$mail_href);
+  } elsif ($mail_unix_href eq "N/A") {
+   print "Unable to parse e-mail web link, this e-mail will not be processed...\n";
+   print "$mail_href\n";
+   recordFailedEmail($mail_uid,$mail_href);
+  } else {
+   if($mail_href =~ m/$strUrlOut/) {
+    fetchMail($mail_href, "From ".$mail_unix_from."  ".$mail_unix_rec, $mail_uid, "outbox");
+   } else {
+    fetchMail($mail_href, "From ".$mail_unix_from."  ".$mail_unix_rec, $mail_uid, "mbox");
+   }
+  }
+ }
+}
+
+sub createExcPattern {
+ if(keys( %mailfolderexc ) > 0 ) {
+  print "Number of folder exclusions: ".keys( %mailfolderexc )."\n" if (defined $DEBUG);
+  foreach my $key (sort (keys(%mailfolderexc))) {
+   print "$key\n" if (defined $DEBUG);
+   $excpattern = $excpattern."|".$key;
+  }
+  print "Exclusion pattern: (".$excpattern.")\n" if (defined $DEBUG); 
+ } else {
+  print "There are no excluded folders. \"Full\" download.\n" if (defined $DEBUG);
+ } 
+}
+
+sub fetchMail {
+ my($web_url, $web_header, $web_id, $web_type) = @_;
+ my $web_request = HTTP::Request->new(GET => $web_url, HTTP::Headers->new("Translate" => "f"));
+ $web_request->content_type("text/xml; charset=utf-8");
+ if($strMethod eq "windows-basic") {
+  $web_request->authorization_basic($strDomain."\\".$strAlias, $strPassword);
+ }
+ my $response = $ua->request($web_request);
+ if ($response->is_success) {
+  if($web_type eq "mbox") {
+   open (MBOX, ">>$strMbox") or die(print "Can't open mailbox file: $!\n");
+  } else {
+   open (MBOX, ">>$strOutbox") or die(print "Can't open mailbox file: $!\n");
+  }
+  my $web_body = $response->content;
+  $web_body =~ s/\r\n?/\n/g;;
+  print MBOX $web_header;
+  print MBOX "\n";
+  print MBOX $web_body;
+  print MBOX "\n";
+  close (MBOX);
+  recordEmail($web_id);
+  print "Message ($web_id) fetch successful...\n";
+  return 0;
+ } else {
+  print "Message ($web_id) fetch failed...\n";
+  print "Failed URL ($web_url) ...\n";
+  recordFailedEmail($web_id, $web_url);
+  return 1;
+ }
+}
+
+sub recordEmail {
+ my($web_id) = @_;
+ open (MHIST, ">>$strHistory") or die(print "Can't open history file: $!\n");
+ print MHIST "UID=".$web_id."\n";
+ close (MHIST);
+}
+
+sub recordFailedEmail {
+ my($web_id, $web_url) = @_;
+ open (MERR, ">>$strError") or die(print "Can't open error file: $!\n");
+ print MERR "UID=".$web_id."\n";
+ print MERR "URL=".$web_url."\n";
+ recordEmail($web_id);
+ close (MERR);
+}
+
+
+sub checkModule {
+  my $mod = shift;
+  eval("use $mod");
+  if ($@) {
+    #print "\$@ = $@\n";
+    return(0);
+  } else {
+    return(1);
+  }
+}
+
+sub CookieCount {
+ my($text) = @_;
+ my @cookies = split(/\n/, $text);
+ #print "Number of cookies: ".@cookies."\n";
+ my $count = @cookies;
+ return $count;
+}
