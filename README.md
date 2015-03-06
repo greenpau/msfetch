@@ -37,8 +37,8 @@ Downloads
 
 Please use the below links to download version 0.5 of `msfetch`:
 
--   [msfetch.tar.gz]()
--   [MD5 Hash]()
+-   [msfetch.tar.gz](msfetch.tar.gz)
+-   [MD5 Hash](msfetch.md5.txt)
 
 The `msfetch.tar.gz` package contains the following files:
 
